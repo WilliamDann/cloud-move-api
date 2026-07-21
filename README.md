@@ -1,7 +1,9 @@
 # cloud-move
 
 Chess engine gateway. Exposes a single HTTP API over multiple engine services
-(Stockfish, Maia 3), validates requests, and proxies them to the right engine.
+([Stockfish](https://github.com/official-stockfish/Stockfish),
+[Maia 3](https://github.com/CSSLab/maia3)), validates requests, and proxies
+them to the right engine.
 Runs on Cloud Run; engines are separate services behind it (see `engines/`).
 
 ## API
