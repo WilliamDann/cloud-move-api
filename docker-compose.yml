@@ -1,0 +1,24 @@
+# local stack: gateway + both engine services, mirroring the cloud run
+# topology. engines are reachable by service name inside the network; host
+# ports 8081/8082 are mapped only for poking the engines directly.
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # API_KEYS intentionally unset: auth disabled for local testing
+      MODELS: '[{"id":"stockfish","name":"Stockfish 17","url":"http://stockfish:8080","cache":true},{"id":"maia3","name":"Maia 3","url":"http://maia3:8080","model":"maia3-79m"},{"id":"maia3-fast","name":"Maia 3 Fast","url":"http://maia3:8080","model":"maia3-23m"},{"id":"maia3-xfast","name":"Maia 3 xFast","url":"http://maia3:8080","model":"maia3-5m"}]'
+    depends_on:
+      - stockfish
+      - maia3
+
+  stockfish:
+    build: ./engines/stockfish
+    ports:
+      - "8081:8080"
+
+  maia3:
+    build: ./engines/maia3
+    ports:
+      - "8082:8080"
