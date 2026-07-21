@@ -26,7 +26,7 @@ for local dev). `/health` is always open.
 - `POST /warm` `{ model_id }` — pre-load a model so the first predict skips
   the cold start; fire-and-forget.
 
-Full request/response schemas in [design.md](design.md).
+Full request/response schemas in [design](design).
 
 ## Configuration
 
