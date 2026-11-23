@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -237,6 +238,111 @@ func TestValidateGameGateway(t *testing.T) {
 	}
 	if err := validateGame("", make([]string, maxMoves+1)); err == nil {
 		t.Error("oversized move list accepted")
+	}
+}
+
+// fakeCQLEngine is a cql engine stub that echoes a canned response and
+// records the last request body for assertion.
+func fakeCQLEngine(t *testing.T, status int, response string) (*httptest.Server, *atomic.Value) {
+	t.Helper()
+	var lastBody atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastBody.Store(string(body))
+		w.WriteHeader(status)
+		w.Write([]byte(response))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &lastBody
+}
+
+func queryRequest(t *testing.T, reg *registry, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/query", strings.NewReader(body))
+	req.Body = http.MaxBytesReader(httptest.NewRecorder(), req.Body, maxQueryBytes+maxPGNBytes+(1<<20))
+	rec := httptest.NewRecorder()
+	reg.handleQuery(rec, req)
+	return rec
+}
+
+func TestQueryNotConfigured(t *testing.T) {
+	reg := testRegistry("http://unused")
+	reg.cqlURL = ""
+
+	rec := queryRequest(t, reg, `{"query":"cql().","pgn":"1. e4"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("unconfigured engine got %d, want 503", rec.Code)
+	}
+}
+
+func TestQueryValidation(t *testing.T) {
+	srv, _ := fakeCQLEngine(t, 200, `{}`)
+	reg := testRegistry(srv.URL)
+	reg.cqlURL = srv.URL
+	reg.clients[srv.URL] = srv.Client()
+
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"missing query", `{"pgn":"1. e4"}`, http.StatusBadRequest},
+		{"missing pgn", `{"query":"cql()."}`, http.StatusBadRequest},
+		{"oversized query", `{"query":"` + strings.Repeat("x", maxQueryBytes+1) + `","pgn":"1. e4"}`, http.StatusBadRequest},
+		{"bad json", `{`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := queryRequest(t, reg, tc.body)
+			if rec.Code != tc.want {
+				t.Errorf("got %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestQueryProxiesResponse(t *testing.T) {
+	const engineResponse = `{"matches":[{"game":0,"ply":4}],"total_matches":1,"truncated":false,"scanned_games":2}`
+	srv, lastBody := fakeCQLEngine(t, 200, engineResponse)
+	reg := testRegistry(srv.URL)
+	reg.cqlURL = srv.URL
+	reg.clients[srv.URL] = srv.Client()
+
+	rec := queryRequest(t, reg, `{"query":"cql().","pgn":"1. e4","max_matches":900}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != engineResponse {
+		t.Errorf("body = %q, want engine response passed through", rec.Body.String())
+	}
+
+	// the upstream request must carry the clamped max_matches
+	upstream := lastBody.Load().(string)
+	if !strings.Contains(upstream, `"max_matches":100`) {
+		t.Errorf("upstream body = %s, want clamped max_matches 100", upstream)
+	}
+}
+
+func TestQueryEngineErrorPassesThrough(t *testing.T) {
+	srv, _ := fakeCQLEngine(t, http.StatusGatewayTimeout, "query timed out")
+	reg := testRegistry(srv.URL)
+	reg.cqlURL = srv.URL
+	reg.clients[srv.URL] = srv.Client()
+
+	rec := queryRequest(t, reg, `{"query":"cql().","pgn":"1. e4"}`)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("got %d, want 504 passed through", rec.Code)
+	}
+}
+
+func TestQueryEngineDown(t *testing.T) {
+	reg := testRegistry("http://127.0.0.1:1") // nothing listens here
+	reg.cqlURL = "http://127.0.0.1:1"
+	reg.clients["http://127.0.0.1:1"] = &http.Client{Timeout: time.Second}
+
+	rec := queryRequest(t, reg, `{"query":"cql().","pgn":"1. e4"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("got %d, want 502", rec.Code)
 	}
 }
 

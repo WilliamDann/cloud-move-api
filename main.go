@@ -74,6 +74,12 @@ const (
 
 	// ~1KB per entry; comfortably holds every position of a day's lessons
 	maxCacheEntries = 4096
+
+	// /query limits — mirror engines/cql; the gateway enforces them first
+	// so bad requests never reach the engine
+	maxQueryBytes = 4096
+	maxPGNBytes   = 5 << 20 // 5 MB
+	maxMatchesCap = 100
 )
 
 // validateGame checks the FEN parses and every move is legal from it
@@ -180,7 +186,7 @@ func (reg *registry) handlePredict(w http.ResponseWriter, r *http.Request) {
 		// the marshaled body is canonical (fixed field order), so it is the key
 		var hit bool
 		engineResp, hit, err = reg.cache.do(model.ID+"|"+string(body), func() (engineResponse, error) {
-			return reg.callEngine(model, body)
+			return reg.callEngine(r.Context(), model, body)
 		})
 		if err == nil {
 			if hit {
@@ -190,7 +196,7 @@ func (reg *registry) handlePredict(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		engineResp, err = reg.callEngine(model, body)
+		engineResp, err = reg.callEngine(r.Context(), model, body)
 	}
 	if err != nil {
 		slog.Error("engine request failed", "model", model.ID, "error", err)
@@ -223,8 +229,13 @@ func (reg *registry) handlePredict(w http.ResponseWriter, r *http.Request) {
 }
 
 // callEngine posts one analysis request to the model's engine api
-func (reg *registry) callEngine(model Model, body []byte) (engineResponse, error) {
-	resp, err := reg.clients[model.URL].Post(model.URL+"/analysis", "application/json", bytes.NewReader(body))
+func (reg *registry) callEngine(ctx context.Context, model Model, body []byte) (engineResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, model.URL+"/analysis", bytes.NewReader(body))
+	if err != nil {
+		return engineResponse{}, fmt.Errorf("engine request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := reg.clients[model.URL].Do(req)
 	if err != nil {
 		return engineResponse{}, fmt.Errorf("engine unavailable: %w", err)
 	}
@@ -270,7 +281,14 @@ func (reg *registry) handleWarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := reg.clients[model.URL].Post(model.URL+"/warm", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, model.URL+"/warm", bytes.NewReader(body))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "warm failed")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := reg.clients[model.URL].Do(req)
 	if err != nil {
 		slog.Error("engine warm failed", "model", model.ID, "error", err)
 		w.WriteHeader(http.StatusBadGateway)
@@ -299,6 +317,84 @@ func (reg *registry) handleWarm(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Add("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"model_id": model.ID, "already_warm": warmResp.AlreadyWarm})
+}
+
+// handleQuery forwards a CQL query + pgn corpus to the cql engine. The
+// response is streamed through unchanged — the engine owns the schema.
+func (reg *registry) handleQuery(w http.ResponseWriter, r *http.Request) {
+	if reg.cqlURL == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "cql engine not configured")
+		return
+	}
+
+	// bound the body before decoding: query + pgn + json overhead
+	r.Body = http.MaxBytesReader(w, r.Body, maxQueryBytes+maxPGNBytes+(1<<20))
+
+	var req struct {
+		Query      string `json:"query"`
+		PGN        string `json:"pgn"`
+		MaxMatches *int   `json:"max_matches"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, "invalid request data (body over 5 MB or malformed json)")
+		return
+	}
+	if req.Query == "" || req.PGN == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, "missing query or pgn")
+		return
+	}
+	if len(req.Query) > maxQueryBytes {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "query too long (max %d bytes)", maxQueryBytes)
+		return
+	}
+	if len(req.PGN) > maxPGNBytes {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "pgn too large (max %d bytes)", maxPGNBytes)
+		return
+	}
+	topN := 25
+	if req.MaxMatches != nil {
+		topN = *req.MaxMatches
+	}
+	topN = clamp(topN, 1, maxMatchesCap)
+
+	body, err := json.Marshal(map[string]any{"query": req.Query, "pgn": req.PGN, "max_matches": topN})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "query failed")
+		return
+	}
+
+	req2, err := http.NewRequestWithContext(r.Context(), http.MethodPost, reg.cqlURL+"/query", bytes.NewReader(body))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "query failed")
+		return
+	}
+	req2.Header.Set("Content-Type", "application/json")
+	resp, err := reg.clients[reg.cqlURL].Do(req2)
+	if err != nil {
+		slog.Error("cql engine unavailable", "error", err)
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, "engine unavailable")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+	// pass engine error status and a short body through
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	w.WriteHeader(resp.StatusCode)
+	w.Write(msg)
 }
 
 // cors allows the browser app to call the gateway from another origin
@@ -348,6 +444,7 @@ func main() {
 	mux.HandleFunc("GET /models", reg.handleModels)
 	mux.HandleFunc("POST /predict", reg.handlePredict)
 	mux.HandleFunc("POST /warm", reg.handleWarm)
+	mux.HandleFunc("POST /query", reg.handleQuery)
 
 	// comma-separated so a new key can be added before the old one is retired
 	var keys []string

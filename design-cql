@@ -1,0 +1,155 @@
+## CQL Query Engine
+
+Run CQL (Chess Query Language) queries against a PGN corpus. New engine
+service alongside stockfish/maia3, plus a gateway /query route and a
+chess-lms /api/cql proxy.
+
+## Requirements
+- user supplies a PGN file per request (their own games, lesson games)
+- user supplies free-form CQL; the engine returns matching game positions
+- synchronous, seconds-scale latency (small-to-mid corpora, capped sizes)
+- later: school database of all student games (admins/coaches upload);
+  the corpus is a parameter from day one so that phase is additive only
+
+## Spike results (CQL 6.2, build 9.493 — verified against the real binary)
+- the reference implementation is gady costeff's CQL:
+  https://www.gadycosteff.com/cql/ — prebuilt for win/mac, and a source
+  zip for linux (cql6-source-9-493.zip). it is a STANDALONE executable:
+  no gcc, no per-query codegen (the compile-cache plan is dropped).
+  alternative: CQLi by robert gamble (cql64.com), a faster CQL 6.1
+  interpreter — candidate for a later swap, same http contract.
+- linux build (per the zip's readme, verified on trixie gcc 14): extract
+  to cqlsourcedist/, uncomment the gcc OSFLAGS + LINUXPTHREADOPTION lines
+  in makefile-flags, `make cql`. ~65 MB with -g; strip brings it down.
+- invocation: `cql -s -noheader -i in.pgn -o out.pgn -matchstring
+  cqlmatch query.cql`. command-line options OVERRIDE the cql file header,
+  so the caller controls input/output even when the query sets `input`.
+  -s for single-threaded (robust on hand-made pgn). -noheader drops the
+  per-game "{Game number N cqlmatch}" comment, which contains the
+  matchstring and would masquerade as a ply-0 match.
+- output contract (verified): each matched position is marked by a
+  {cqlmatch} comment AFTER the san that produced it; a match at the
+  start position is a bare {cqlmatch} before the first san. a game that
+  matches but has no matching positions cannot occur (game matches iff a
+  position matches). zero matches = exit 0 + empty out.pgn.
+  fens come from replaying the parsed moves.
+- security-relevant filters exist (readfile/writefile/persistent, and
+  `input` in the cql header): run in a fresh temp dir per request as cwd,
+  non-root container, no network egress. cli -i/-o pin the corpus i/o.
+
+## Decisions
+- implementation: wrap reference CQL 6.2 (see spike). no compile cache,
+  no gcc in the runtime image.
+- sync request/response (no jobs) — scan is seconds-scale for the capped
+  corpus sizes; revisit async only for the school database.
+- no response cache in v1: user corpora are one-off queries. Revisit if
+  the school database creates hot repeated queries.
+
+## Data Model
+
+No MODELS entry — cql is not a predict model (no elo/checkpoint/cache
+semantics). The gateway routes /query to a single engine url.
+
+env:
+  CQL_ENGINE_URL : internal cql engine api url (gateway side)
+  CQL_PATH       : path to the cql executable (engine side, default "cql")
+
+## API Design
+
+### Gateway: POST /query
+Auth: same X-API-Key as /predict. Not cached.
+
+{
+  query       : string   // cql source, capped (4 KB)
+  pgn         : string   // inline corpus, capped (5 MB)
+  max_matches ?: int     // capped at 100, default 25
+}
+-> {
+  matches     : { game: int, ply: int, fen?: string, move?: string,
+                  white?: string, black?: string, date?: string }[]
+  total_matches : int
+  truncated   : bool     // total_matches > len(matches)
+  scanned_games : int
+}
+
+- game is the 0-based index into the input pgn; ply is the half-move
+  number of the matched position (0 = before the first move); move is
+  the san leading into the position ("" for the start position); fen is
+  the position itself, omitted if replay failed
+- gateway enforces size caps only (query length, pgn bytes, max_matches)
+  via http.MaxBytesReader; chess-content validation happens in the engine
+- return match locations, not PGN blobs — small responses, cache-safe
+- callEngine passes r.Context() (http.NewRequestWithContext); /query is
+  the longest request and client disconnects should propagate
+
+### Engine: POST /query
+Same request/response shapes as the gateway route.
+
+Per-request flow:
+1. validate: query non-empty + under cap; pgn under cap and under the
+   game cap (light structural count — cql parses the games itself)
+2. run: fresh temp dir; write query.cql + input.pgn; execute
+   `cql -s -i input.pgn -o out.pgn -matchstring cqlmatch query.cql`
+   with a 120s context (hard kill on expiry; nothing persistent to
+   keep warm); stdout/stderr captured for diagnostics
+3. parse out.pgn: split games (header blocks + movetext), scan movetext
+   for marker comments while counting san tokens (ply), replay each
+   matched game with notnil/chess up to the last matched ply for fens
+4. respond; delete the request's temp dir
+
+Missing out.pgn or a nonzero exit without output = 500 with a stderr
+snippet. An exit code with a produced out.pgn is parsed regardless —
+cql's exit convention for "no matches" is not load-bearing.
+
+Latency budget: seconds-scale for the capped corpus (no compile step).
+Engine handler timeout 120s.
+
+### chess-lms: /api/cql proxy
+Mirror /api/engine (app/api/engine/route.ts):
+- Supabase session required (not an open relay)
+- caps: query 4 KB, pgn 5 MB, max_matches 100, 60s AbortSignal.timeout
+- MOVE_GATEWAY_URL + MOVE_GATEWAY_API_KEY server-side only
+- maps gateway errors to friendly messages (query syntax, size caps,
+  timeout) so the query editor can point at the problem
+
+## Sandbox posture (free-form CQL)
+cql is a query interpreter, but its filters can read/write files:
+- dedicated container: non-root, no network egress, concurrency 1
+- fresh temp dir per request (cwd), removed after; no other writable path
+- cli -i/-o pin corpus i/o; container fs is otherwise read-only to the
+  process user; Cloud Run CPU/memory limits bound resource use
+- response capped by max_matches (a query matching every position would
+  otherwise emit a huge output pgn — parsed but truncated in response)
+
+## Limits (summary)
+  query        4 KB      enforced gateway + engine
+  pgn          5 MB      enforced gateway + engine
+  games        20000     engine, structural count
+  max_matches  100       enforced gateway + engine
+  scan timeout 120s      engine, hard kill
+  lms timeout  60s       /api/cql AbortSignal
+
+## Work breakdown
+1. spike: done (see above) — contract pinned, source zip build verified
+   on first docker build
+2. engines/cql service: main.go (server + runner), parse.go (output pgn
+   parsing + replay), Dockerfile (cql built from pinned source zip),
+   compose entry (:8083), testdata/fake-cql.sh test double
+3. gateway POST /query: size caps, MaxBytesReader, context-aware
+   callEngine
+4. tests: valid/invalid output parsing, oversized query/pgn, game cap,
+   timeout kill, truncation, gateway caps + proxying
+5. chess-lms /api/cql proxy + env wiring (reuses MOVE_GATEWAY_URL)
+6. deploy: separate Cloud Run service for the cql engine, wire
+   CQL_ENGINE_URL
+
+## Later phases
+- school database: corpus becomes corpus_url (Supabase signed URL) or
+  corpus_id — the engine contract already treats the PGN as a parameter.
+  Signed URLs keep Supabase credentials out of cloud-move.
+- shared-corpus caching: key = hash(query) + hash(corpus) once hot
+  repeated queries exist
+- async jobs (submit + poll) if school-database scans exceed the
+  sync budget
+- curated query library in the LMS (pins, hanging pieces, ...) reusing
+  the same endpoint — free-form ships first, curated is product work

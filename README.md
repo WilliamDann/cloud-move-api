@@ -27,6 +27,17 @@ for local dev). `/health` is always open.
   `temperature`; Stockfish-only: `depth`, `time`, `movetime_ms`, `skill`.
 - `POST /warm` `{ model_id }` — pre-load a model so the first predict skips
   the cold start; fire-and-forget.
+- `POST /query` → CQL matches for a PGN corpus (cql engine):
+  ```json
+  {
+    "query": "cql().",       // cql source, capped 4 KB
+    "pgn": "...",            // corpus, capped 5 MB
+    "max_matches": 25        // capped 100
+  }
+  ```
+  Returns `{ matches: [{ game, ply, fen?, move?, white?, black?, date? }],
+  total_matches, truncated, scanned_games }` — match locations, not PGN
+  blobs. Requires `CQL_ENGINE_URL`; unset = 503. See [design-cql](design-cql).
 
 Full request/response schemas in [design](design).
 
@@ -37,6 +48,7 @@ Full request/response schemas in [design](design).
 | `MODELS`   | JSON array of models (id, name, url, model, elo, cache) |
 | `API_KEYS` | Comma-separated API keys; unset disables auth       |
 | `PORT`     | Listen port (default 8080)                          |
+| `CQL_ENGINE_URL` | cql engine api url; enables `POST /query`     |
 
 Deterministic models with `cache: true` get an LRU + singleflight response
 cache (skill-limited requests are never cached).

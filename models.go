@@ -34,6 +34,7 @@ type registry struct {
 	byID    map[string]Model
 	clients map[string]*http.Client // one per engine url
 	cache   *resultCache            // shared across cache-enabled models
+	cqlURL  string                  // cql engine api url ("" = not configured)
 }
 
 func newRegistry(ctx context.Context) (*registry, error) {
@@ -74,6 +75,20 @@ func newRegistry(ctx context.Context) (*registry, error) {
 		// pays the weight load before the search runs
 		client.Timeout = 150 * time.Second
 		reg.clients[model.URL] = client
+	}
+
+	// the cql engine is not a predict model — one url, routed separately
+	if cqlURL := os.Getenv("CQL_ENGINE_URL"); cqlURL != "" {
+		reg.cqlURL = cqlURL
+		if _, ok := reg.clients[cqlURL]; !ok {
+			client, err := idtoken.NewClient(ctx, cqlURL)
+			if err != nil {
+				slog.Warn("using unauthenticated client", "url", cqlURL, "error", err)
+				client = &http.Client{}
+			}
+			client.Timeout = 150 * time.Second
+			reg.clients[cqlURL] = client
+		}
 	}
 	return reg, nil
 }
